@@ -78,20 +78,24 @@ These files are compatible with Tor's hidden service directory format.
 
 The generator uses several optimizations to maximize throughput:
 
-- **Incremental point addition**: Instead of computing a full Ed25519 scalar multiplication per key (~8μs), each iteration performs a point addition (~62ns) plus compression (~2μs), yielding ~3.8x speedup per iteration
-- **Raw byte prefix matching**: For prefix patterns, the base32 prefix is decoded to raw bytes once, and matching is done directly against public key bytes (~0.4ns vs ~12ns for base32 encode + compare)
-- **Native CPU instructions**: Build configuration enables `target-cpu=native` for AVX2/SIMD acceleration of field arithmetic
+- **Batch Montgomery inversion**: For prefix patterns, 64 points are compressed using a single field inversion + 189 multiplications instead of 64 inversions, yielding ~30x faster compression and ~16x overall speedup
+- **Custom Ed25519 field arithmetic**: Self-contained `Fe` (field element) and `ExtendedPoint` modules implement GF(2^255-19) arithmetic and extended twisted Edwards point operations without constant-time overhead
+- **Precomputed Niels addition**: The increment point is precomputed in Niels form `(Y+X, Y-X, Z, 2dXY)` for 8-multiply additions (~54ns each)
+- **Raw byte prefix matching**: For prefix patterns, the base32 prefix is decoded to raw bytes once, and matching is done directly against public key bytes (~2.4ns)
 - **Periodic re-randomization**: Keys are re-randomized every 1M iterations to avoid long sequential scalar runs
 
 ### Benchmark Results
 
 | Operation | Time |
 |-----------|------|
-| Full old iteration (scalar mul + base32 + match) | ~7.95 μs |
-| Full new iteration (point add + compress + raw match) | ~2.11 μs |
-| Point addition | ~62 ns |
-| Point compression | ~2.05 μs |
-| Raw byte prefix match | ~0.4 ns |
+| **Batch keygen (64 pts: add + compress + match)** | **~8.0 μs (~125 ns/pt)** |
+| Individual keygen (dalek: add + compress + match) | ~2.08 μs/pt |
+| Batch compress 64 points | ~4.1 μs (~64 ns/pt) |
+| Individual compress 64 points (dalek) | ~124 μs (~1.9 μs/pt) |
+| Point addition (ours / dalek) | ~54 ns / ~60 ns |
+| Raw byte prefix match | ~2.4 ns |
+
+**Compression speedup: ~30x. Overall per-iteration speedup: ~16.5x.**
 
 Run benchmarks with:
 

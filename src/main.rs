@@ -7,7 +7,13 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 fn main() {
-    let default_threads: &'static str = Box::leak(num_cpus::get().to_string().into_boxed_str());
+    let default_threads: &'static str = Box::leak(
+        std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(1)
+            .to_string()
+            .into_boxed_str(),
+    );
     let matches = Command::new("OnionGen")
         .version("1.1")
         .author("n0madic")

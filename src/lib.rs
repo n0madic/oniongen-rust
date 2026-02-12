@@ -1,6 +1,10 @@
+pub mod fe;
+pub mod point;
+
 use curve25519_dalek::edwards::EdwardsPoint;
 use curve25519_dalek::scalar::Scalar;
 use data_encoding::BASE32_NOPAD;
+use point::{batch_compress, ExtendedPoint};
 use rand::rngs::SysRng;
 use rand::{Rng as _, SeedableRng as _, TryRng as _};
 use rand_chacha::ChaCha20Rng;
@@ -15,6 +19,7 @@ pub const ONION_BASE32_LEN: usize = 56;
 pub const PREFIX_PUBKEY_ONLY_MAX: usize = 51;
 pub const EXIT_CHECK_MASK: u32 = 0x3ff;
 pub const RERANDOMIZE_INTERVAL: u64 = 1_000_000;
+pub const BATCH_SIZE: usize = 64;
 
 /// Tor v3 file headers (32 bytes each: 29 chars + 3 null bytes)
 pub const SECRET_KEY_HEADER: &[u8; 32] = b"== ed25519v1-secret: type0 ==\0\0\0";
@@ -235,14 +240,8 @@ pub fn save(onion_address: &str, expanded_key: &[u8; 64], public_key: &[u8; 32])
     fs::write(hostname_file, format!("{}.onion\n", onion_address)).unwrap();
 }
 
-pub fn generate(
-    matcher: &AddressMatcher,
-    found: &AtomicUsize,
-    target: usize,
-    total_generated: &AtomicUsize,
-    should_exit: &AtomicBool,
-) {
-    let mut local_generated = 0usize;
+/// Initialize RNG, scalar, and expanded key for a worker thread
+fn init_worker() -> (ChaCha20Rng, Scalar, [u8; 64]) {
     let mut sys_rng = SysRng;
     let mut seed = [0u8; 32];
     sys_rng
@@ -250,7 +249,6 @@ pub fn generate(
         .expect("failed to seed thread RNG");
     let mut rng = ChaCha20Rng::from_seed(seed);
 
-    // Initialize expanded key (64 bytes: clamped scalar || random nonce)
     let mut expanded_key = [0u8; 64];
     rng.fill_bytes(&mut expanded_key);
 
@@ -258,10 +256,151 @@ pub fn generate(
     clamp_scalar(&mut scalar_bytes);
     expanded_key[..32].copy_from_slice(&scalar_bytes);
 
-    let mut scalar = Scalar::from_bytes_mod_order(scalar_bytes);
-    let mut point = EdwardsPoint::mul_base(&scalar);
+    let scalar = Scalar::from_bytes_mod_order(scalar_bytes);
+    (rng, scalar, expanded_key)
+}
 
-    // Precompute increment: delta = 8 to preserve clamping (low 3 bits = 0)
+/// Re-randomize the scalar and point for a worker thread
+fn rerandomize(rng: &mut ChaCha20Rng, expanded_key: &mut [u8; 64]) -> Scalar {
+    rng.fill_bytes(expanded_key);
+    let mut scalar_bytes: [u8; 32] = expanded_key[..32].try_into().unwrap();
+    clamp_scalar(&mut scalar_bytes);
+    expanded_key[..32].copy_from_slice(&scalar_bytes);
+    Scalar::from_bytes_mod_order(scalar_bytes)
+}
+
+/// Handle a match: build onion address, save files, update counters.
+/// Returns true if the search should stop.
+fn handle_match(
+    public_key: &[u8; 32],
+    scalar: &Scalar,
+    expanded_key: &mut [u8; 64],
+    found: &AtomicUsize,
+    target: usize,
+    should_exit: &AtomicBool,
+) -> bool {
+    let mut onion_address_bytes = [0u8; 35];
+    let mut onion_base32 = [0u8; ONION_BASE32_LEN];
+    let mut sha3 = Sha3_256::new();
+
+    fill_onion_bytes(public_key, &mut onion_address_bytes, &mut sha3);
+    BASE32_NOPAD.encode_mut(&onion_address_bytes, &mut onion_base32);
+    for c in &mut onion_base32[..ONION_BASE32_LEN] {
+        c.make_ascii_lowercase();
+    }
+    let onion_address =
+        std::str::from_utf8(&onion_base32[..ONION_BASE32_LEN]).expect("base32 output is ASCII");
+
+    let scalar_out = scalar.to_bytes();
+    expanded_key[..32].copy_from_slice(&scalar_out);
+
+    save(onion_address, expanded_key, public_key);
+
+    let prev_count = found.fetch_add(1, Ordering::Relaxed);
+    if target != 0 && prev_count + 1 >= target {
+        should_exit.store(true, Ordering::Relaxed);
+        return true;
+    }
+    false
+}
+
+/// Batched generate for RawPrefix matchers: uses batch Montgomery inversion
+/// to compress 64 points with only 1 field inversion instead of 64.
+fn generate_batched(
+    matcher: &AddressMatcher,
+    found: &AtomicUsize,
+    target: usize,
+    total_generated: &AtomicUsize,
+    should_exit: &AtomicBool,
+) {
+    let (mut rng, mut scalar, mut expanded_key) = init_worker();
+    let nonce_bytes: [u8; 32] = expanded_key[32..64].try_into().unwrap();
+
+    let delta_scalar = Scalar::from(8u64);
+    let dalek_delta = EdwardsPoint::mul_base(&delta_scalar);
+
+    // Convert initial point to our representation
+    let dalek_point = EdwardsPoint::mul_base(&scalar);
+    let mut our_point =
+        ExtendedPoint::from_compressed(dalek_point.compress().as_bytes()).unwrap();
+    let our_delta =
+        ExtendedPoint::from_compressed(dalek_delta.compress().as_bytes()).unwrap();
+    let delta_niels = our_delta.as_projective_niels();
+
+    let mut local_generated = 0usize;
+    let mut iterations_since_rerandomize = 0u64;
+    let mut points_buf = Vec::with_capacity(BATCH_SIZE);
+
+    loop {
+        if should_exit.load(Ordering::Relaxed) {
+            break;
+        }
+
+        // Phase 1: Generate batch of points via Niels addition
+        points_buf.clear();
+        let batch_base_scalar = scalar;
+        for _ in 0..BATCH_SIZE {
+            points_buf.push(our_point);
+            our_point = our_point.add_niels(&delta_niels);
+            scalar += delta_scalar;
+        }
+
+        // Phase 2: Batch compress (1 inversion for BATCH_SIZE points)
+        let compressed = batch_compress(&points_buf);
+        local_generated += BATCH_SIZE;
+
+        // Phase 3: Check matches
+        for (i, pk_bytes) in compressed.iter().enumerate() {
+            if matcher.is_match_raw(pk_bytes) {
+                let match_scalar =
+                    batch_base_scalar + delta_scalar * Scalar::from(i as u64);
+                // Restore nonce in expanded_key
+                expanded_key[32..64].copy_from_slice(&nonce_bytes);
+                if handle_match(
+                    pk_bytes,
+                    &match_scalar,
+                    &mut expanded_key,
+                    found,
+                    target,
+                    should_exit,
+                ) {
+                    total_generated.fetch_add(local_generated, Ordering::Relaxed);
+                    return;
+                }
+            }
+        }
+
+        // Re-randomize check
+        iterations_since_rerandomize += BATCH_SIZE as u64;
+        if iterations_since_rerandomize >= RERANDOMIZE_INTERVAL {
+            iterations_since_rerandomize = 0;
+            scalar = rerandomize(&mut rng, &mut expanded_key);
+            let dalek_point = EdwardsPoint::mul_base(&scalar);
+            our_point =
+                ExtendedPoint::from_compressed(dalek_point.compress().as_bytes()).unwrap();
+        }
+
+        // Counter update
+        if local_generated >= 10000 {
+            total_generated.fetch_add(local_generated, Ordering::Relaxed);
+            local_generated = 0;
+        }
+    }
+
+    total_generated.fetch_add(local_generated, Ordering::Relaxed);
+}
+
+/// Non-batched generate for Regex/Prefix matchers (needs full base32 encoding)
+fn generate_individual(
+    matcher: &AddressMatcher,
+    found: &AtomicUsize,
+    target: usize,
+    total_generated: &AtomicUsize,
+    should_exit: &AtomicBool,
+) {
+    let (mut rng, mut scalar, mut expanded_key) = init_worker();
+
+    let mut point = EdwardsPoint::mul_base(&scalar);
     let delta_scalar = Scalar::from(8u64);
     let delta_point = EdwardsPoint::mul_base(&delta_scalar);
 
@@ -270,9 +409,8 @@ pub fn generate(
     let mut onion_base32 = [0u8; ONION_BASE32_LEN];
     let mut sha3 = Sha3_256::new();
     let mut tick = 0u32;
+    let mut local_generated = 0usize;
     let mut iterations_since_rerandomize = 0u64;
-
-    let uses_raw_prefix = matcher.uses_raw_prefix();
 
     loop {
         tick = tick.wrapping_add(1);
@@ -285,20 +423,16 @@ pub fn generate(
         let mut full_address_ready = false;
         local_generated += 1;
 
-        let is_match = if uses_raw_prefix {
-            matcher.is_match_raw(public_key)
-        } else {
-            match matcher {
-                AddressMatcher::Prefix(prefix) if prefix.len() <= PREFIX_PUBKEY_ONLY_MAX => {
-                    BASE32_NOPAD.encode_mut(public_key, &mut pubkey_base32);
-                    pubkey_base32[..prefix.len()] == prefix[..]
-                }
-                _ => {
-                    fill_onion_bytes(public_key, &mut onion_address_bytes, &mut sha3);
-                    BASE32_NOPAD.encode_mut(&onion_address_bytes, &mut onion_base32);
-                    full_address_ready = true;
-                    matcher.is_match(&onion_base32)
-                }
+        let is_match = match matcher {
+            AddressMatcher::Prefix(prefix) if prefix.len() <= PREFIX_PUBKEY_ONLY_MAX => {
+                BASE32_NOPAD.encode_mut(public_key, &mut pubkey_base32);
+                pubkey_base32[..prefix.len()] == prefix[..]
+            }
+            _ => {
+                fill_onion_bytes(public_key, &mut onion_address_bytes, &mut sha3);
+                BASE32_NOPAD.encode_mut(&onion_address_bytes, &mut onion_base32);
+                full_address_ready = true;
+                matcher.is_match(&onion_base32)
             }
         };
 
@@ -313,7 +447,6 @@ pub fn generate(
             let onion_address = std::str::from_utf8(&onion_base32[..ONION_BASE32_LEN])
                 .expect("base32 output is ASCII");
 
-            // Write the current scalar back into expanded_key
             let scalar_out = scalar.to_bytes();
             expanded_key[..32].copy_from_slice(&scalar_out);
 
@@ -326,19 +459,13 @@ pub fn generate(
             }
         }
 
-        // Increment: fast point addition instead of scalar multiplication
         point += delta_point;
         scalar += delta_scalar;
 
-        // Periodically re-randomize to avoid long sequential runs
         iterations_since_rerandomize += 1;
         if iterations_since_rerandomize >= RERANDOMIZE_INTERVAL {
             iterations_since_rerandomize = 0;
-            rng.fill_bytes(&mut expanded_key);
-            scalar_bytes = expanded_key[..32].try_into().unwrap();
-            clamp_scalar(&mut scalar_bytes);
-            expanded_key[..32].copy_from_slice(&scalar_bytes);
-            scalar = Scalar::from_bytes_mod_order(scalar_bytes);
+            scalar = rerandomize(&mut rng, &mut expanded_key);
             point = EdwardsPoint::mul_base(&scalar);
         }
 
@@ -349,4 +476,19 @@ pub fn generate(
     }
 
     total_generated.fetch_add(local_generated, Ordering::Relaxed);
+}
+
+/// Main entry point: dispatches to batched or individual generator
+pub fn generate(
+    matcher: &AddressMatcher,
+    found: &AtomicUsize,
+    target: usize,
+    total_generated: &AtomicUsize,
+    should_exit: &AtomicBool,
+) {
+    if matcher.uses_raw_prefix() {
+        generate_batched(matcher, found, target, total_generated, should_exit);
+    } else {
+        generate_individual(matcher, found, target, total_generated, should_exit);
+    }
 }

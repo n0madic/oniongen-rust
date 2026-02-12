@@ -7,7 +7,6 @@ edition = "2021"
 clap = { version = "4.5", features = ["derive"] }
 curve25519-dalek = { version = "4", features = ["precomputed-tables"] }
 data-encoding = "2.10"
-num_cpus = "1.17"
 rand = "0.10"
 rand_chacha = "0.10"
 rayon = "1.11"
@@ -16,6 +15,8 @@ sha3 = "0.10"
 
 [dev-dependencies]
 criterion = "0.8"
+ed25519-dalek = { version = "2.2", features = ["hazmat"] }
+sha2 = "0.10"
 
 [[bench]]
 name = "keygen"
