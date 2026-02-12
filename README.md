@@ -2,7 +2,7 @@
 
 ## Description
 
-This is a Rust implementation of the oniongen tool, which generates vanity .onion addresses for the Tor network. The tool allows users to specify a pattern that the generated address should start with, and it will generate addresses until it finds one that matches the pattern.
+This is a Rust implementation of the oniongen tool, which generates vanity .onion addresses for the Tor network. The tool accepts a regex pattern and generates addresses until it finds matches.
 
 ## Usage
 
@@ -12,13 +12,13 @@ To use the tool, simply run the following command:
 oniongen <pattern>
 ```
 
-Where `<pattern>` is the pattern that the generated address should start with. For example, to generate an address that starts with `facebook`, you would run:
+Where `<pattern>` is a regex applied to the generated onion hostname (without `.onion`). For example, to generate an address that starts with `facebook`, you would run:
 
 ```bash
-oniongen facebook
+oniongen '^facebook'
 ```
 
-The tool will then generate addresses until it finds one that starts with `facebook`, and will output the address once it finds it.
+The tool will then generate addresses until it finds one that matches `^facebook`, and will output the address once it finds it.
 
 ## Help
 
@@ -36,5 +36,4 @@ Options:
   -h, --help           Print help
   -V, --version        Print version
 ```
-
 

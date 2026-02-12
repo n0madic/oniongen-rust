@@ -1,52 +1,162 @@
+use clap::{value_parser, Arg, Command};
+use data_encoding::BASE32_NOPAD;
 use ed25519_dalek::{SigningKey, VerifyingKey};
-use rand::rngs::OsRng;
-use rand::RngCore;
-use sha2::{Sha512, Digest};
+use memchr::memmem;
+use rand::rngs::SysRng;
+use rand::{Rng as _, SeedableRng as _, TryRng as _};
+use rand_chacha::ChaCha20Rng;
+use rayon::prelude::*;
+use regex::bytes::{Regex, RegexBuilder};
+use sha2::{Digest, Sha512};
 use sha3::Sha3_256;
-use base32;
-use regex::bytes::Regex;
 use std::fs;
 use std::path::Path;
-use std::sync::atomic::{AtomicUsize, AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
-use std::time::{Instant, Duration};
-use rayon::prelude::*;
 use std::thread;
-use clap::{Arg, Command, value_parser};
+use std::time::{Duration, Instant};
+
+const PUBKEY_BASE32_LEN: usize = 52;
+const ONION_BASE32_LEN: usize = 56;
+const PREFIX_PUBKEY_ONLY_MAX: usize = 51;
+const EXIT_CHECK_MASK: u32 = 0x3ff;
+
+enum AddressMatcher {
+    Prefix(Vec<u8>),
+    Literal(Vec<u8>),
+    Regex(Regex),
+}
+
+impl AddressMatcher {
+    #[inline]
+    fn is_match(&self, onion_base32: &[u8]) -> bool {
+        match self {
+            Self::Prefix(prefix) => onion_base32.starts_with(prefix),
+            Self::Literal(literal) => memmem::find(onion_base32, literal).is_some(),
+            Self::Regex(re) => re.is_match(onion_base32),
+        }
+    }
+}
+
+#[inline]
+fn is_base32_char(b: u8) -> bool {
+    matches!(b, b'a'..=b'z' | b'A'..=b'Z' | b'2'..=b'7')
+}
+
+#[inline]
+fn is_regex_meta(b: u8) -> bool {
+    matches!(
+        b,
+        b'.' | b'^'
+            | b'$'
+            | b'*'
+            | b'+'
+            | b'?'
+            | b'('
+            | b')'
+            | b'['
+            | b']'
+            | b'{'
+            | b'}'
+            | b'|'
+            | b'\\'
+    )
+}
+
+fn parse_simple_prefix(pattern: &str) -> Option<Vec<u8>> {
+    if let Some(prefix) = pattern.strip_prefix('^') {
+        if !prefix.is_empty() && prefix.as_bytes().iter().copied().all(is_base32_char) {
+            return Some(prefix.to_ascii_uppercase().into_bytes());
+        }
+    }
+    None
+}
+
+fn parse_literal(pattern: &str) -> Option<Vec<u8>> {
+    if pattern.is_empty()
+        || pattern.as_bytes().iter().copied().any(is_regex_meta)
+        || !pattern.as_bytes().iter().copied().all(is_base32_char)
+    {
+        return None;
+    }
+
+    Some(pattern.to_ascii_uppercase().into_bytes())
+}
+
+fn build_matcher(pattern: &str) -> AddressMatcher {
+    if let Some(prefix) = parse_simple_prefix(pattern) {
+        AddressMatcher::Prefix(prefix)
+    } else if let Some(literal) = parse_literal(pattern) {
+        AddressMatcher::Literal(literal)
+    } else {
+        let re = RegexBuilder::new(pattern)
+            .case_insensitive(true)
+            .build()
+            .expect("Invalid regex pattern");
+        AddressMatcher::Regex(re)
+    }
+}
 
 fn generate(
-    re: &Regex,
+    matcher: &AddressMatcher,
     found: &AtomicUsize,
     target: usize,
     total_generated: &AtomicUsize,
     should_exit: &AtomicBool,
 ) {
-    let mut local_generated = 0;
+    let mut local_generated = 0usize;
+    let mut seed = [0u8; 32];
+    let mut sys_rng = SysRng;
+    sys_rng
+        .try_fill_bytes(&mut seed)
+        .expect("failed to seed thread RNG");
+    let mut rng = ChaCha20Rng::from_seed(seed);
     let mut secret_key = [0u8; 32];
     let mut onion_address_bytes = [0u8; 35];
-    let mut checksum_bytes = [0u8; 67];
+    let mut pubkey_base32 = [0u8; PUBKEY_BASE32_LEN];
+    let mut onion_base32 = [0u8; ONION_BASE32_LEN];
+    let mut sha3 = Sha3_256::new();
+    let mut tick = 0u32;
 
-    while !should_exit.load(Ordering::Relaxed) {
-        OsRng.fill_bytes(&mut secret_key);
+    loop {
+        tick = tick.wrapping_add(1);
+        if (tick & EXIT_CHECK_MASK) == 0 && should_exit.load(Ordering::Relaxed) {
+            break;
+        }
+
+        rng.fill_bytes(&mut secret_key);
         let signing_key = SigningKey::from_bytes(&secret_key);
         let verifying_key = signing_key.verifying_key();
-
-        encode_public_key(
-            &verifying_key,
-            &mut onion_address_bytes,
-            &mut checksum_bytes,
-        );
-
+        let public_key = verifying_key.as_bytes();
+        let mut full_address_ready = false;
         local_generated += 1;
 
-        if re.is_match(&onion_address_bytes) {
-            let onion_address = base32::encode(
-                base32::Alphabet::RFC4648 { padding: false },
-                &onion_address_bytes,
-            ).to_lowercase();
-            save(&onion_address, &signing_key, &verifying_key);
+        let is_match = match matcher {
+            AddressMatcher::Prefix(prefix) if prefix.len() <= PREFIX_PUBKEY_ONLY_MAX => {
+                BASE32_NOPAD.encode_mut(public_key, &mut pubkey_base32);
+                pubkey_base32[..prefix.len()] == prefix[..]
+            }
+            _ => {
+                fill_onion_bytes(public_key, &mut onion_address_bytes, &mut sha3);
+                BASE32_NOPAD.encode_mut(&onion_address_bytes, &mut onion_base32);
+                full_address_ready = true;
+                matcher.is_match(&onion_base32)
+            }
+        };
 
-            let prev_count = found.fetch_add(1, Ordering::SeqCst);
+        if is_match {
+            if !full_address_ready {
+                fill_onion_bytes(public_key, &mut onion_address_bytes, &mut sha3);
+                BASE32_NOPAD.encode_mut(&onion_address_bytes, &mut onion_base32);
+            }
+            for c in &mut onion_base32[..ONION_BASE32_LEN] {
+                c.make_ascii_lowercase();
+            }
+            let onion_address = std::str::from_utf8(&onion_base32[..ONION_BASE32_LEN])
+                .expect("base32 output is ASCII");
+            save(onion_address, &signing_key, &verifying_key);
+
+            let prev_count = found.fetch_add(1, Ordering::Relaxed);
             if target != 0 && prev_count + 1 >= target {
                 should_exit.store(true, Ordering::Relaxed);
                 break;
@@ -75,19 +185,19 @@ fn expand_secret_key(secret_key: &[u8]) -> [u8; 64] {
 }
 
 #[inline]
-fn encode_public_key(
-    public_key: &VerifyingKey,
-    onion_address_bytes: &mut [u8],
-    checksum_bytes: &mut [u8],
+fn fill_onion_bytes(
+    public_key: &[u8; 32],
+    onion_address_bytes: &mut [u8; 35],
+    sha3: &mut Sha3_256,
 ) {
-    checksum_bytes[..15].copy_from_slice(b".onion checksum");
-    checksum_bytes[15..47].copy_from_slice(public_key.as_bytes());
-    checksum_bytes[47] = 0x03;
+    onion_address_bytes[..32].copy_from_slice(public_key);
+    sha3.update(b".onion checksum");
+    sha3.update(public_key);
+    sha3.update([0x03]);
+    let checksum = sha3.finalize_reset();
 
-    let checksum = Sha3_256::digest(&checksum_bytes[..48]);
-
-    onion_address_bytes[..32].copy_from_slice(public_key.as_bytes());
-    onion_address_bytes[32..34].copy_from_slice(&checksum[..2]);
+    onion_address_bytes[32] = checksum[0];
+    onion_address_bytes[33] = checksum[1];
     onion_address_bytes[34] = 0x03;
 }
 
@@ -114,8 +224,8 @@ fn save(onion_address: &str, signing_key: &SigningKey, verifying_key: &Verifying
 fn main() {
     let default_threads: &'static str = Box::leak(num_cpus::get().to_string().into_boxed_str());
     let matches = Command::new("OnionGen")
-        .version("1.0")
-        .author("Your Name")
+        .version("1.1")
+        .author("n0madic")
         .about("Generates Onion addresses matching a given pattern")
         .arg(
             Arg::new("pattern")
@@ -147,7 +257,7 @@ fn main() {
     let num_addresses = *matches.get_one::<usize>("number").unwrap();
     let num_threads = *matches.get_one::<usize>("threads").unwrap();
 
-    let re = Arc::new(Regex::new(pattern).expect("Invalid regex pattern"));
+    let matcher = Arc::new(build_matcher(pattern));
 
     let found = Arc::new(AtomicUsize::new(0));
     let total_generated = Arc::new(AtomicUsize::new(0));
@@ -177,8 +287,21 @@ fn main() {
         }
     });
 
-    (0..num_threads).into_par_iter().for_each(|_| {
-        generate(&re, &found, num_addresses, &total_generated, &should_exit);
+    let pool = rayon::ThreadPoolBuilder::new()
+        .num_threads(num_threads)
+        .build()
+        .expect("failed to build rayon thread pool");
+
+    pool.install(|| {
+        (0..num_threads).into_par_iter().for_each(|_| {
+            generate(
+                &matcher,
+                &found,
+                num_addresses,
+                &total_generated,
+                &should_exit,
+            );
+        });
     });
 
     should_exit.store(true, Ordering::Relaxed);

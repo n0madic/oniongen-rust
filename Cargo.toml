@@ -4,15 +4,26 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-base32 = "^0.4"
+base32 = "0.5"
 clap = { version = "4.5", features = ["derive"] }
 crossbeam = "0.8"
 crossbeam-channel = "0.5"
-ed25519-dalek = "^2.1"
-num_cpus = "1.13"
-rand = { version = "0.8", features = ["small_rng"] }
-rand_core = "0.6"
-rayon = "1.5"
-regex = "1.5"
+data-encoding = "2.10"
+ed25519-dalek = "2.2"
+memchr = "2.8"
+num_cpus = "1.17"
+rand = "0.10"
+rand_chacha = "0.10"
+rayon = "1.11"
+regex = "1.12"
 sha2 = "0.10"
 sha3 = "0.10"
+
+[dev-dependencies]
+criterion = "0.8"
+
+[profile.release]
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+strip = true
