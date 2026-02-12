@@ -61,7 +61,7 @@ fn main() {
     let progress_handle = thread::spawn(move || {
         let report_interval = Duration::from_secs(5);
         let mut last_report = Instant::now();
-        while !progress_should_exit.load(Ordering::Relaxed) {
+        while !progress_should_exit.load(Ordering::Acquire) {
             thread::sleep(Duration::from_millis(100));
             if last_report.elapsed() >= report_interval {
                 let total = progress_total_generated.load(Ordering::Relaxed);
@@ -95,7 +95,7 @@ fn main() {
         });
     });
 
-    should_exit.store(true, Ordering::Relaxed);
+    should_exit.store(true, Ordering::Release);
     progress_handle.join().unwrap();
 
     let total = total_generated.load(Ordering::Relaxed);

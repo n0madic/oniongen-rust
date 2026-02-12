@@ -41,9 +41,7 @@ impl AddressMatcher {
     #[inline]
     pub fn is_match(&self, onion_base32: &[u8]) -> bool {
         match self {
-            Self::RawPrefix { .. } => {
-                unreachable!("RawPrefix should use is_match_raw")
-            }
+            Self::RawPrefix { .. } => false,
             Self::Prefix(prefix) => onion_base32.starts_with(prefix),
             Self::Regex(re) => re.is_match(onion_base32),
         }
@@ -68,7 +66,7 @@ impl AddressMatcher {
                 }
                 true
             }
-            _ => unreachable!("is_match_raw called on non-RawPrefix"),
+            _ => false,
         }
     }
 
@@ -218,90 +216,184 @@ pub fn fill_onion_bytes(
     onion_address_bytes[34] = 0x03;
 }
 
-pub fn save(onion_address: &str, expanded_key: &[u8; 64], public_key: &[u8; 32]) {
+/// Save generated onion address files to disk.
+///
+/// Writes three files into a directory named after the onion address:
+/// - `hs_ed25519_secret_key`: 32-byte Tor header + 64-byte expanded key
+/// - `hs_ed25519_public_key`: 32-byte Tor header + 32-byte public key
+/// - `hostname`: the `.onion` address as text
+///
+/// The expanded key layout follows Tor's `hs_ed25519_secret_key` format:
+/// - Bytes [0..32]: Clamped Ed25519 scalar (private scalar used for signing)
+/// - Bytes [32..64]: Nonce prefix (right half of SHA-512(seed) per RFC 8032),
+///   used for deterministic signature nonce generation
+///
+/// Tor reads the public key from the separate `hs_ed25519_public_key` file,
+/// not from the expanded key. This format is verified against Tor's source
+/// (`ed25519_tor.c`, `ed25519_donna_sign()`).
+pub fn save(
+    onion_address: &str,
+    expanded_key: &[u8; 64],
+    public_key: &[u8; 32],
+) -> std::io::Result<()> {
     let dir_path = Path::new(onion_address);
-    fs::create_dir_all(dir_path).unwrap();
+    fs::create_dir_all(dir_path)?;
 
     // Secret key file: 32-byte header + 64-byte expanded key = 96 bytes
     let secret_key_file = dir_path.join("hs_ed25519_secret_key");
     let mut secret_key_contents = Vec::with_capacity(96);
     secret_key_contents.extend_from_slice(SECRET_KEY_HEADER);
     secret_key_contents.extend_from_slice(expanded_key);
-    fs::write(secret_key_file, secret_key_contents).unwrap();
+    fs::write(secret_key_file, secret_key_contents)?;
 
     // Public key file: 32-byte header + 32-byte public key = 64 bytes
     let public_key_file = dir_path.join("hs_ed25519_public_key");
     let mut public_key_contents = Vec::with_capacity(64);
     public_key_contents.extend_from_slice(PUBLIC_KEY_HEADER);
     public_key_contents.extend_from_slice(public_key);
-    fs::write(public_key_file, public_key_contents).unwrap();
+    fs::write(public_key_file, public_key_contents)?;
 
     let hostname_file = dir_path.join("hostname");
-    fs::write(hostname_file, format!("{}.onion\n", onion_address)).unwrap();
+    fs::write(hostname_file, format!("{}.onion\n", onion_address))?;
+
+    Ok(())
 }
 
-/// Initialize RNG, scalar, and expanded key for a worker thread
-fn init_worker() -> (ChaCha20Rng, Scalar, [u8; 64]) {
-    let mut sys_rng = SysRng;
-    let mut seed = [0u8; 32];
-    sys_rng
-        .try_fill_bytes(&mut seed)
-        .expect("failed to seed thread RNG");
-    let mut rng = ChaCha20Rng::from_seed(seed);
-
-    let mut expanded_key = [0u8; 64];
-    rng.fill_bytes(&mut expanded_key);
-
-    let mut scalar_bytes: [u8; 32] = expanded_key[..32].try_into().unwrap();
-    clamp_scalar(&mut scalar_bytes);
-    expanded_key[..32].copy_from_slice(&scalar_bytes);
-
-    let scalar = Scalar::from_bytes_mod_order(scalar_bytes);
-    (rng, scalar, expanded_key)
+/// Per-thread worker state for key generation.
+///
+/// Encapsulates the RNG, current scalar, expanded key, and bookkeeping
+/// shared between the batched and individual generator paths.
+struct Worker {
+    rng: ChaCha20Rng,
+    scalar: Scalar,
+    expanded_key: [u8; 64],
+    nonce_bytes: [u8; 32],
+    local_generated: usize,
+    iterations_since_rerandomize: u64,
 }
 
-/// Re-randomize the scalar and point for a worker thread
-fn rerandomize(rng: &mut ChaCha20Rng, expanded_key: &mut [u8; 64]) -> Scalar {
-    rng.fill_bytes(expanded_key);
-    let mut scalar_bytes: [u8; 32] = expanded_key[..32].try_into().unwrap();
-    clamp_scalar(&mut scalar_bytes);
-    expanded_key[..32].copy_from_slice(&scalar_bytes);
-    Scalar::from_bytes_mod_order(scalar_bytes)
-}
+impl Worker {
+    /// Create a new worker with a securely seeded RNG and random starting key.
+    fn new() -> Self {
+        let mut sys_rng = SysRng;
+        let mut seed = [0u8; 32];
+        sys_rng
+            .try_fill_bytes(&mut seed)
+            .expect("failed to seed thread RNG");
+        let mut rng = ChaCha20Rng::from_seed(seed);
 
-/// Handle a match: build onion address, save files, update counters.
-/// Returns true if the search should stop.
-fn handle_match(
-    public_key: &[u8; 32],
-    scalar: &Scalar,
-    expanded_key: &mut [u8; 64],
-    found: &AtomicUsize,
-    target: usize,
-    should_exit: &AtomicBool,
-) -> bool {
-    let mut onion_address_bytes = [0u8; 35];
-    let mut onion_base32 = [0u8; ONION_BASE32_LEN];
-    let mut sha3 = Sha3_256::new();
+        let mut expanded_key = [0u8; 64];
+        rng.fill_bytes(&mut expanded_key);
 
-    fill_onion_bytes(public_key, &mut onion_address_bytes, &mut sha3);
-    BASE32_NOPAD.encode_mut(&onion_address_bytes, &mut onion_base32);
-    for c in &mut onion_base32[..ONION_BASE32_LEN] {
-        c.make_ascii_lowercase();
+        let mut scalar_bytes: [u8; 32] = expanded_key[..32].try_into().unwrap();
+        clamp_scalar(&mut scalar_bytes);
+        expanded_key[..32].copy_from_slice(&scalar_bytes);
+
+        let scalar = Scalar::from_bytes_mod_order(scalar_bytes);
+        let nonce_bytes: [u8; 32] = expanded_key[32..64].try_into().unwrap();
+
+        Self {
+            rng,
+            scalar,
+            expanded_key,
+            nonce_bytes,
+            local_generated: 0,
+            iterations_since_rerandomize: 0,
+        }
     }
-    let onion_address =
-        std::str::from_utf8(&onion_base32[..ONION_BASE32_LEN]).expect("base32 output is ASCII");
 
-    let scalar_out = scalar.to_bytes();
-    expanded_key[..32].copy_from_slice(&scalar_out);
+    /// Re-randomize the scalar and expanded key to jump to a new random
+    /// starting point in the keyspace.
+    ///
+    /// Each worker explores keys by stepping through consecutive multiples of
+    /// the cofactor (8), covering only 1/8th of the keyspace from any starting
+    /// point. Periodically re-randomizing jumps to a completely new random
+    /// starting point, ensuring full keyspace coverage over time.
+    ///
+    /// Returns `true` if re-randomization occurred (caller must rebuild their
+    /// point from `self.scalar`).
+    fn maybe_rerandomize(&mut self, iterations: u64) -> bool {
+        self.iterations_since_rerandomize += iterations;
+        if self.iterations_since_rerandomize < RERANDOMIZE_INTERVAL {
+            return false;
+        }
+        self.iterations_since_rerandomize = 0;
 
-    save(onion_address, expanded_key, public_key);
+        self.rng.fill_bytes(&mut self.expanded_key);
+        let mut scalar_bytes: [u8; 32] = self.expanded_key[..32].try_into().unwrap();
+        clamp_scalar(&mut scalar_bytes);
+        self.expanded_key[..32].copy_from_slice(&scalar_bytes);
+        self.scalar = Scalar::from_bytes_mod_order(scalar_bytes);
+        self.nonce_bytes.copy_from_slice(&self.expanded_key[32..64]);
 
-    let prev_count = found.fetch_add(1, Ordering::Relaxed);
-    if target != 0 && prev_count + 1 >= target {
-        should_exit.store(true, Ordering::Relaxed);
-        return true;
+        true
     }
-    false
+
+    /// Flush local counter to the shared atomic if above threshold.
+    fn maybe_flush_counter(&mut self, total: &AtomicUsize, threshold: usize) {
+        if self.local_generated >= threshold {
+            total.fetch_add(self.local_generated, Ordering::Relaxed);
+            self.local_generated = 0;
+        }
+    }
+
+    /// Flush remaining local counter to the shared atomic on exit.
+    fn final_flush(&self, total: &AtomicUsize) {
+        total.fetch_add(self.local_generated, Ordering::Relaxed);
+    }
+
+    /// Handle a match: build onion address, save files, update counters.
+    ///
+    /// Returns `Ok(true)` if the search should stop (target reached),
+    /// `Ok(false)` to continue, or `Err` on I/O failure.
+    fn on_match(
+        &mut self,
+        public_key: &[u8; 32],
+        match_scalar: &Scalar,
+        found: &AtomicUsize,
+        target: usize,
+        should_exit: &AtomicBool,
+    ) -> std::io::Result<bool> {
+        let mut onion_address_bytes = [0u8; 35];
+        let mut onion_base32 = [0u8; ONION_BASE32_LEN];
+        let mut sha3 = Sha3_256::new();
+
+        fill_onion_bytes(public_key, &mut onion_address_bytes, &mut sha3);
+        BASE32_NOPAD.encode_mut(&onion_address_bytes, &mut onion_base32);
+        for c in &mut onion_base32[..ONION_BASE32_LEN] {
+            c.make_ascii_lowercase();
+        }
+        let onion_address =
+            std::str::from_utf8(&onion_base32[..ONION_BASE32_LEN]).expect("base32 output is ASCII");
+
+        // Write the matching scalar into the expanded key for saving.
+        // The nonce prefix (bytes [32..64]) is preserved from init/rerandomize.
+        let scalar_out = match_scalar.to_bytes();
+        self.expanded_key[..32].copy_from_slice(&scalar_out);
+        // Restore nonce bytes in case a previous on_match overwrote them
+        self.expanded_key[32..64].copy_from_slice(&self.nonce_bytes);
+
+        save(onion_address, &self.expanded_key, public_key)?;
+
+        let prev_count = found.fetch_add(1, Ordering::Relaxed);
+        if target != 0 && prev_count + 1 >= target {
+            should_exit.store(true, Ordering::Release);
+            return Ok(true);
+        }
+        Ok(false)
+    }
+
+    /// Get the current scalar value.
+    #[inline]
+    fn scalar(&self) -> Scalar {
+        self.scalar
+    }
+
+    /// Add a delta to the current scalar.
+    #[inline]
+    fn add_scalar(&mut self, delta: Scalar) {
+        self.scalar += delta;
+    }
 }
 
 /// Batched generate for RawPrefix matchers: uses batch Montgomery inversion
@@ -313,81 +405,76 @@ fn generate_batched(
     total_generated: &AtomicUsize,
     should_exit: &AtomicBool,
 ) {
-    let (mut rng, mut scalar, mut expanded_key) = init_worker();
-    let nonce_bytes: [u8; 32] = expanded_key[32..64].try_into().unwrap();
+    let mut worker = Worker::new();
 
+    // The delta between consecutive key candidates is 8 (the Ed25519 cofactor).
+    // Adding the cofactor guarantees that consecutive points remain in the
+    // prime-order subgroup, which is required for valid Ed25519 public keys.
+    // Each starting point explores 1/8th of the keyspace; rerandomize()
+    // periodically jumps to a new random starting point to cover the full space.
     let delta_scalar = Scalar::from(8u64);
     let dalek_delta = EdwardsPoint::mul_base(&delta_scalar);
 
     // Convert initial point to our representation
-    let dalek_point = EdwardsPoint::mul_base(&scalar);
-    let mut our_point =
-        ExtendedPoint::from_compressed(dalek_point.compress().as_bytes()).unwrap();
-    let our_delta =
-        ExtendedPoint::from_compressed(dalek_delta.compress().as_bytes()).unwrap();
+    let dalek_point = EdwardsPoint::mul_base(&worker.scalar());
+    let mut our_point = ExtendedPoint::from_compressed(dalek_point.compress().as_bytes()).unwrap();
+    let our_delta = ExtendedPoint::from_compressed(dalek_delta.compress().as_bytes()).unwrap();
     let delta_niels = our_delta.as_projective_niels();
 
-    let mut local_generated = 0usize;
-    let mut iterations_since_rerandomize = 0u64;
     let mut points_buf = Vec::with_capacity(BATCH_SIZE);
 
     loop {
-        if should_exit.load(Ordering::Relaxed) {
+        if should_exit.load(Ordering::Acquire) {
             break;
         }
 
         // Phase 1: Generate batch of points via Niels addition
         points_buf.clear();
-        let batch_base_scalar = scalar;
+        let batch_base_scalar = worker.scalar();
         for _ in 0..BATCH_SIZE {
             points_buf.push(our_point);
             our_point = our_point.add_niels(&delta_niels);
-            scalar += delta_scalar;
+            worker.add_scalar(delta_scalar);
         }
 
         // Phase 2: Batch compress (1 inversion for BATCH_SIZE points)
         let compressed = batch_compress(&points_buf);
-        local_generated += BATCH_SIZE;
+        worker.local_generated += BATCH_SIZE;
 
         // Phase 3: Check matches
+        let mut should_stop = false;
         for (i, pk_bytes) in compressed.iter().enumerate() {
             if matcher.is_match_raw(pk_bytes) {
-                let match_scalar =
-                    batch_base_scalar + delta_scalar * Scalar::from(i as u64);
-                // Restore nonce in expanded_key
-                expanded_key[32..64].copy_from_slice(&nonce_bytes);
-                if handle_match(
-                    pk_bytes,
-                    &match_scalar,
-                    &mut expanded_key,
-                    found,
-                    target,
-                    should_exit,
-                ) {
-                    total_generated.fetch_add(local_generated, Ordering::Relaxed);
-                    return;
+                let match_scalar = batch_base_scalar + delta_scalar * Scalar::from(i as u64);
+                match worker.on_match(pk_bytes, &match_scalar, found, target, should_exit) {
+                    Ok(true) => {
+                        should_stop = true;
+                        break;
+                    }
+                    Ok(false) => {}
+                    Err(e) => {
+                        eprintln!("I/O error saving address: {e}");
+                        should_stop = true;
+                        break;
+                    }
                 }
             }
         }
+        if should_stop {
+            worker.final_flush(total_generated);
+            return;
+        }
 
         // Re-randomize check
-        iterations_since_rerandomize += BATCH_SIZE as u64;
-        if iterations_since_rerandomize >= RERANDOMIZE_INTERVAL {
-            iterations_since_rerandomize = 0;
-            scalar = rerandomize(&mut rng, &mut expanded_key);
-            let dalek_point = EdwardsPoint::mul_base(&scalar);
-            our_point =
-                ExtendedPoint::from_compressed(dalek_point.compress().as_bytes()).unwrap();
+        if worker.maybe_rerandomize(BATCH_SIZE as u64) {
+            let dalek_point = EdwardsPoint::mul_base(&worker.scalar());
+            our_point = ExtendedPoint::from_compressed(dalek_point.compress().as_bytes()).unwrap();
         }
 
-        // Counter update
-        if local_generated >= 10000 {
-            total_generated.fetch_add(local_generated, Ordering::Relaxed);
-            local_generated = 0;
-        }
+        worker.maybe_flush_counter(total_generated, 10000);
     }
 
-    total_generated.fetch_add(local_generated, Ordering::Relaxed);
+    worker.final_flush(total_generated);
 }
 
 /// Non-batched generate for Regex/Prefix matchers (needs full base32 encoding)
@@ -398,9 +485,14 @@ fn generate_individual(
     total_generated: &AtomicUsize,
     should_exit: &AtomicBool,
 ) {
-    let (mut rng, mut scalar, mut expanded_key) = init_worker();
+    let mut worker = Worker::new();
 
-    let mut point = EdwardsPoint::mul_base(&scalar);
+    let mut point = EdwardsPoint::mul_base(&worker.scalar());
+    // The delta between consecutive key candidates is 8 (the Ed25519 cofactor).
+    // Adding the cofactor guarantees that consecutive points remain in the
+    // prime-order subgroup, which is required for valid Ed25519 public keys.
+    // Each starting point explores 1/8th of the keyspace; rerandomize()
+    // periodically jumps to a new random starting point to cover the full space.
     let delta_scalar = Scalar::from(8u64);
     let delta_point = EdwardsPoint::mul_base(&delta_scalar);
 
@@ -409,19 +501,17 @@ fn generate_individual(
     let mut onion_base32 = [0u8; ONION_BASE32_LEN];
     let mut sha3 = Sha3_256::new();
     let mut tick = 0u32;
-    let mut local_generated = 0usize;
-    let mut iterations_since_rerandomize = 0u64;
 
     loop {
         tick = tick.wrapping_add(1);
-        if (tick & EXIT_CHECK_MASK) == 0 && should_exit.load(Ordering::Relaxed) {
+        if (tick & EXIT_CHECK_MASK) == 0 && should_exit.load(Ordering::Acquire) {
             break;
         }
 
         let compressed = point.compress();
         let public_key: &[u8; 32] = compressed.as_bytes();
         let mut full_address_ready = false;
-        local_generated += 1;
+        worker.local_generated += 1;
 
         let is_match = match matcher {
             AddressMatcher::Prefix(prefix) if prefix.len() <= PREFIX_PUBKEY_ONLY_MAX => {
@@ -447,35 +537,38 @@ fn generate_individual(
             let onion_address = std::str::from_utf8(&onion_base32[..ONION_BASE32_LEN])
                 .expect("base32 output is ASCII");
 
-            let scalar_out = scalar.to_bytes();
-            expanded_key[..32].copy_from_slice(&scalar_out);
+            // Write the matching scalar into the expanded key for saving.
+            // The nonce prefix (bytes [32..64]) is preserved from init/rerandomize.
+            let scalar_out = worker.scalar().to_bytes();
+            worker.expanded_key[..32].copy_from_slice(&scalar_out);
+            worker.expanded_key[32..64].copy_from_slice(&worker.nonce_bytes);
 
-            save(onion_address, &expanded_key, public_key);
+            match save(onion_address, &worker.expanded_key, public_key) {
+                Ok(()) => {}
+                Err(e) => {
+                    eprintln!("I/O error saving address: {e}");
+                    break;
+                }
+            }
 
             let prev_count = found.fetch_add(1, Ordering::Relaxed);
             if target != 0 && prev_count + 1 >= target {
-                should_exit.store(true, Ordering::Relaxed);
+                should_exit.store(true, Ordering::Release);
                 break;
             }
         }
 
         point += delta_point;
-        scalar += delta_scalar;
+        worker.add_scalar(delta_scalar);
 
-        iterations_since_rerandomize += 1;
-        if iterations_since_rerandomize >= RERANDOMIZE_INTERVAL {
-            iterations_since_rerandomize = 0;
-            scalar = rerandomize(&mut rng, &mut expanded_key);
-            point = EdwardsPoint::mul_base(&scalar);
+        if worker.maybe_rerandomize(1) {
+            point = EdwardsPoint::mul_base(&worker.scalar());
         }
 
-        if local_generated.is_multiple_of(10000) {
-            total_generated.fetch_add(local_generated, Ordering::Relaxed);
-            local_generated = 0;
-        }
+        worker.maybe_flush_counter(total_generated, 10000);
     }
 
-    total_generated.fetch_add(local_generated, Ordering::Relaxed);
+    worker.final_flush(total_generated);
 }
 
 /// Main entry point: dispatches to batched or individual generator

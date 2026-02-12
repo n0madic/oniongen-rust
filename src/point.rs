@@ -192,10 +192,8 @@ mod tests {
         let dalek_pt = DalekPoint::mul_base(&scalar);
         let dalek_delta = DalekPoint::mul_base(&delta_scalar);
 
-        let our_pt =
-            ExtendedPoint::from_compressed(dalek_pt.compress().as_bytes()).unwrap();
-        let our_delta =
-            ExtendedPoint::from_compressed(dalek_delta.compress().as_bytes()).unwrap();
+        let our_pt = ExtendedPoint::from_compressed(dalek_pt.compress().as_bytes()).unwrap();
+        let our_delta = ExtendedPoint::from_compressed(dalek_delta.compress().as_bytes()).unwrap();
         let delta_niels = our_delta.as_projective_niels();
 
         // Do 100 sequential additions and verify against dalek
@@ -220,10 +218,8 @@ mod tests {
         let dalek_pt = DalekPoint::mul_base(&scalar);
         let dalek_delta = DalekPoint::mul_base(&delta_scalar);
 
-        let mut our_pt =
-            ExtendedPoint::from_compressed(dalek_pt.compress().as_bytes()).unwrap();
-        let our_delta =
-            ExtendedPoint::from_compressed(dalek_delta.compress().as_bytes()).unwrap();
+        let mut our_pt = ExtendedPoint::from_compressed(dalek_pt.compress().as_bytes()).unwrap();
+        let our_delta = ExtendedPoint::from_compressed(dalek_delta.compress().as_bytes()).unwrap();
         let delta_niels = our_delta.as_projective_niels();
 
         let mut points = Vec::new();
@@ -246,10 +242,8 @@ mod tests {
         let mut dalek_pt = DalekPoint::mul_base(&scalar);
         let dalek_delta = DalekPoint::mul_base(&delta_scalar);
 
-        let mut our_pt =
-            ExtendedPoint::from_compressed(dalek_pt.compress().as_bytes()).unwrap();
-        let our_delta =
-            ExtendedPoint::from_compressed(dalek_delta.compress().as_bytes()).unwrap();
+        let mut our_pt = ExtendedPoint::from_compressed(dalek_pt.compress().as_bytes()).unwrap();
+        let our_delta = ExtendedPoint::from_compressed(dalek_delta.compress().as_bytes()).unwrap();
         let delta_niels = our_delta.as_projective_niels();
 
         let mut points = Vec::new();
@@ -299,8 +293,7 @@ mod tests {
 
         let delta_scalar = Scalar::from(8u64);
         let dalek_delta = DalekPoint::mul_base(&delta_scalar);
-        let our_delta =
-            ExtendedPoint::from_compressed(dalek_delta.compress().as_bytes()).unwrap();
+        let our_delta = ExtendedPoint::from_compressed(dalek_delta.compress().as_bytes()).unwrap();
         let delta_niels = our_delta.as_projective_niels();
 
         // Simulate key generation as done in generate_batched()
@@ -356,12 +349,12 @@ mod tests {
             // Verify the signature using the batch-compressed public key
             vk_from_batch
                 .verify(message, &signature)
-                .expect(&format!("Signature verification failed at index {i}"));
+                .unwrap_or_else(|_| panic!("Signature verification failed at index {i}"));
 
             // Also verify with strict verification
             vk_from_batch
                 .verify_strict(message, &signature)
-                .expect(&format!("Strict signature verification failed at index {i}"));
+                .unwrap_or_else(|_| panic!("Strict signature verification failed at index {i}"));
         }
     }
 
@@ -376,8 +369,7 @@ mod tests {
 
         let delta_scalar = Scalar::from(8u64);
         let dalek_delta = DalekPoint::mul_base(&delta_scalar);
-        let our_delta =
-            ExtendedPoint::from_compressed(dalek_delta.compress().as_bytes()).unwrap();
+        let our_delta = ExtendedPoint::from_compressed(dalek_delta.compress().as_bytes()).unwrap();
         let delta_niels = our_delta.as_projective_niels();
 
         let message = b"re-randomization signature test";
@@ -386,9 +378,7 @@ mod tests {
         for round in 0..3u64 {
             let mut expanded_key = [0u8; 64];
             for (i, byte) in expanded_key.iter_mut().enumerate() {
-                *byte = (i as u8)
-                    .wrapping_mul(51)
-                    .wrapping_add((round * 97) as u8);
+                *byte = (i as u8).wrapping_mul(51).wrapping_add((round * 97) as u8);
             }
             let mut scalar_bytes: [u8; 32] = expanded_key[..32].try_into().unwrap();
             clamp_scalar(&mut scalar_bytes);
@@ -416,13 +406,11 @@ mod tests {
                     scalar: match_scalar,
                     hash_prefix: nonce_bytes,
                 };
-                let vk = VerifyingKey::from_bytes(&compressed[i])
-                    .expect("valid public key");
+                let vk = VerifyingKey::from_bytes(&compressed[i]).expect("valid public key");
 
                 let signature: Signature = raw_sign::<Sha512>(&esk, message, &vk);
-                vk.verify(message, &signature).expect(&format!(
-                    "Signature failed: round {round}, index {i}"
-                ));
+                vk.verify(message, &signature)
+                    .unwrap_or_else(|_| panic!("Signature failed: round {round}, index {i}"));
             }
         }
     }

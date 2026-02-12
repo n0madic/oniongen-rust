@@ -44,10 +44,8 @@ fn bench_our_point_addition(c: &mut Criterion) {
     let dalek_pt = EdwardsPoint::mul_base(&scalar);
     let dalek_delta = EdwardsPoint::mul_base(&Scalar::from(8u64));
 
-    let mut our_pt =
-        ExtendedPoint::from_compressed(dalek_pt.compress().as_bytes()).unwrap();
-    let our_delta =
-        ExtendedPoint::from_compressed(dalek_delta.compress().as_bytes()).unwrap();
+    let mut our_pt = ExtendedPoint::from_compressed(dalek_pt.compress().as_bytes()).unwrap();
+    let our_delta = ExtendedPoint::from_compressed(dalek_delta.compress().as_bytes()).unwrap();
     let delta_niels = our_delta.as_projective_niels();
 
     c.bench_function("point_addition (ours)", |b| {
@@ -75,8 +73,7 @@ fn bench_our_point_compress(c: &mut Criterion) {
     let mut rng = make_rng();
     let (scalar, _) = make_clamped_scalar(&mut rng);
     let dalek_pt = EdwardsPoint::mul_base(&scalar);
-    let our_pt =
-        ExtendedPoint::from_compressed(dalek_pt.compress().as_bytes()).unwrap();
+    let our_pt = ExtendedPoint::from_compressed(dalek_pt.compress().as_bytes()).unwrap();
 
     c.bench_function("point_compress (ours, single)", |b| {
         b.iter(|| {
@@ -92,10 +89,8 @@ fn bench_batch_compress_64(c: &mut Criterion) {
     let dalek_pt = EdwardsPoint::mul_base(&scalar);
     let dalek_delta = EdwardsPoint::mul_base(&Scalar::from(8u64));
 
-    let mut our_pt =
-        ExtendedPoint::from_compressed(dalek_pt.compress().as_bytes()).unwrap();
-    let our_delta =
-        ExtendedPoint::from_compressed(dalek_delta.compress().as_bytes()).unwrap();
+    let mut our_pt = ExtendedPoint::from_compressed(dalek_pt.compress().as_bytes()).unwrap();
+    let our_delta = ExtendedPoint::from_compressed(dalek_delta.compress().as_bytes()).unwrap();
     let delta_niels = our_delta.as_projective_niels();
 
     let mut points = Vec::with_capacity(64);
@@ -140,27 +135,28 @@ fn bench_keygen_batch_full(c: &mut Criterion) {
     let dalek_pt = EdwardsPoint::mul_base(&scalar);
     let dalek_delta = EdwardsPoint::mul_base(&Scalar::from(8u64));
 
-    let mut our_pt =
-        ExtendedPoint::from_compressed(dalek_pt.compress().as_bytes()).unwrap();
-    let our_delta =
-        ExtendedPoint::from_compressed(dalek_delta.compress().as_bytes()).unwrap();
+    let mut our_pt = ExtendedPoint::from_compressed(dalek_pt.compress().as_bytes()).unwrap();
+    let our_delta = ExtendedPoint::from_compressed(dalek_delta.compress().as_bytes()).unwrap();
     let delta_niels = our_delta.as_projective_niels();
 
     let matcher = build_matcher("face");
 
-    c.bench_function("keygen_batch_full (64 pts: add + batch compress + raw match)", |b| {
-        b.iter(|| {
-            let mut points = Vec::with_capacity(64);
-            for _ in 0..64 {
-                points.push(our_pt);
-                our_pt = our_pt.add_niels(&delta_niels);
-            }
-            let compressed = batch_compress(&points);
-            for pk in &compressed {
-                black_box(matcher.is_match_raw(pk));
-            }
-        })
-    });
+    c.bench_function(
+        "keygen_batch_full (64 pts: add + batch compress + raw match)",
+        |b| {
+            b.iter(|| {
+                let mut points = Vec::with_capacity(64);
+                for _ in 0..64 {
+                    points.push(our_pt);
+                    our_pt = our_pt.add_niels(&delta_niels);
+                }
+                let compressed = batch_compress(&points);
+                for pk in &compressed {
+                    black_box(matcher.is_match_raw(pk));
+                }
+            })
+        },
+    );
 }
 
 fn bench_sha3_checksum(c: &mut Criterion) {
@@ -212,16 +208,19 @@ fn bench_keygen_full(c: &mut Criterion) {
     let delta_point = EdwardsPoint::mul_base(&delta_scalar);
     let matcher = build_matcher("face");
 
-    c.bench_function("keygen_full (dalek: point add + compress + raw match)", |b| {
-        b.iter(|| {
-            point += delta_point;
-            scalar += delta_scalar;
-            let compressed = point.compress();
-            let pk = compressed.as_bytes();
-            let matched = matcher.is_match_raw(pk);
-            black_box(matched);
-        })
-    });
+    c.bench_function(
+        "keygen_full (dalek: point add + compress + raw match)",
+        |b| {
+            b.iter(|| {
+                point += delta_point;
+                scalar += delta_scalar;
+                let compressed = point.compress();
+                let pk = compressed.as_bytes();
+                let matched = matcher.is_match_raw(pk);
+                black_box(matched);
+            })
+        },
+    );
 }
 
 fn bench_raw_prefix_match(c: &mut Criterion) {
