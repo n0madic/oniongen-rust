@@ -102,3 +102,27 @@ Run benchmarks with:
 ```bash
 cargo bench
 ```
+
+## Testing
+
+Run unit tests:
+
+```bash
+cargo test
+```
+
+### Integration Tests
+
+Integration tests require the `tor` binary installed and are marked `#[ignore]`.
+
+**Quick validation** (~4s) — verifies generated keys are accepted by `tor --verify-config` and loads correctly on startup:
+
+```bash
+cargo test --test tor_integration -- --ignored --nocapture test_generated_keys_accepted_by_tor
+```
+
+**Full end-to-end** (~1-3 min, requires network) — boots a real Tor daemon, publishes the generated .onion service, and sends data through the Tor SOCKS5 proxy to a local echo server:
+
+```bash
+cargo test --test tor_integration -- --ignored --nocapture test_onion_service_echo_through_tor
+```
