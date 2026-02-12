@@ -1,6 +1,6 @@
 [package]
 name = "oniongen"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
 
 [dependencies]
@@ -16,8 +16,6 @@ sha3 = "0.10"
 
 [dev-dependencies]
 criterion = "0.8"
-ed25519-dalek = "2.2"
-sha2 = "0.10"
 
 [[bench]]
 name = "keygen"
